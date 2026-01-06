@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the associated manuscript and referenced datasets."
+type: software
+title: "λ–I–p framework: reproducible analysis pipeline"
+authors:
+  - family-names: "Ahn"
+    given-names: "Ezekiel"
+license: MIT
+repository-code: "https://github.com/EJSAHN/lambda-I-p-analysis"
