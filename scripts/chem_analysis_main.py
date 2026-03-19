@@ -2,9 +2,9 @@
 """
 chem_analysis_main.py
 
-Reproduces the manuscript-locked λ–I–p analysis from raw morphology spreadsheets and
-writes a single, self-contained Excel workbook (SupplementaryData_S1.xlsx) that downstream
-plotting scripts read *exclusively*.
+Generate a single summary workbook (SupplementaryData_S1.xlsx) from externally supplied
+colony-morphology spreadsheets and derive all downstream summary tables used by the
+λ–I–p analysis framework.
 
 Key outputs (sheet names):
   - summary_metrics                 (MEAN; manuscript main)
@@ -13,18 +13,24 @@ Key outputs (sheet names):
   - Axis_Reconstruction_MEDIAN      (MEDIAN; sensitivity / QA)
   - pI_Chem_tauPrimary              (chemical events; primary tau)
   - pI_Chem_tauSensitivity          (chemical events; tau grid)
+  - pI_Chem_tauWide                 (chemical events; wide-form key indicators across tau)
+  - pI_Control_tauSensitivity       (control baseline events; tau grid)
+  - pI_Control_tauWide              (control baseline events; wide-form key indicators across tau)
+  - Supplementary_Table_S1          (near-equal potency, divergent polarity examples)
+  - Axis_Reconstruction_Validation  (reconstructed vs direct axis ratios)
+  - Axis_Recon_Val_Summary          (validation summary metrics)
   - UV_Lambda_vs_Dose               (UV-C cacao; λ(d))
   - UV_I_vs_Dose                    (UV-C cacao; I(d))
   - UV_ShapeEvent_Coffee10_tau1_10  (UV-C coffee; p-hat @ ~10 min)
   - QA_checks
   - metadata
 
-Manuscript-locked definitions:
+Definitions:
   - S_area = agg(Area_treated) / agg(Area_control)   (agg = mean by default; median also saved)
   - λ_area = -ln(S_area)
   - I_LWR  = ln( agg(LWR_treated) / agg(LWR_control) )
 
-Ellipse-based axis reconstruction (paper/ipynb exact):
+Ellipse-based axis reconstruction:
   - lwr_ratio = exp(I_LWR)
   - a_ratio   = sqrt(S_area * lwr_ratio)
   - b_ratio   = sqrt(S_area / lwr_ratio)
@@ -38,16 +44,14 @@ Event probability:
 Known UV isolate label fix:
   - "P24-55" is a known typo; canonical is "P23-55" (normalized automatically).
 
-Usage (recommended):
+Usage:
   python scripts/chem_analysis_main.py \
-    --chem-xlsx  data/Supplementary\ Data1_ISME\ Com.xlsx \
-    --cacao-xlsx data/Cacao.xlsx \
-    --coffee-xlsx data/Coffee.xlsx \
-    --out-xlsx   outputs/SupplementaryData_S1.xlsx
+    --chem-xlsx  "<path_to_chemical_input.xlsx>" \
+    --cacao-xlsx "<path_to_cacao_uv_input.xlsx>" \
+    --coffee-xlsx "<path_to_coffee_uv_input.xlsx>" \
+    --out-xlsx   "outputs/SupplementaryData_S1.xlsx"
 
-If you place the input spreadsheets under ./data/ using the default filenames above,
-you can omit the CLI arguments and just run:
-  python scripts/chem_analysis_main.py
+All three input spreadsheet paths are required explicitly.
 """
 from __future__ import annotations
 
@@ -55,7 +59,6 @@ import argparse
 import datetime as dt
 import hashlib
 import math
-import os
 import platform
 import re
 import sys
@@ -74,7 +77,7 @@ except Exception:
 
 
 # -------------------------
-# Defaults (manuscript-locked)
+# Defaults (analysis defaults)
 # -------------------------
 DEFAULT_CHEM_TAU_PRIMARY = 1.10
 DEFAULT_CHEM_TAU_SENS = (1.10, 1.15, 1.20)
@@ -363,7 +366,6 @@ def compute_chem_summary_and_axis(df: pd.DataFrame, how: str) -> Tuple[pd.DataFr
     for iso, sub in df.groupby("Isolate", dropna=False):
         ctrl = sub[sub["Treatment"].astype(str).str.strip().str.upper().eq("CONTROL")]
         if len(ctrl) == 0:
-            # Keep going; this should not happen for curated datasets
             continue
 
         A_c = _agg(ctrl["Area"], how)
@@ -393,7 +395,6 @@ def compute_chem_summary_and_axis(df: pd.DataFrame, how: str) -> Tuple[pd.DataFr
                 "agg": how,
             })
 
-            # Axis reconstruction (paper/ipynb exact)
             if pd.notna(S_area) and pd.notna(Ival) and S_area > 0:
                 lwr_ratio = float(math.exp(Ival))
                 a_ratio = float(math.sqrt(S_area * lwr_ratio))
@@ -428,9 +429,6 @@ def compute_chem_summary_and_axis(df: pd.DataFrame, how: str) -> Tuple[pd.DataFr
 
 
 def chem_event_tables(df: pd.DataFrame, tau_primary: float, tau_sens: Iterable[float]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Chemical events defined on absolute LWR: event if LWR >= tau.
-    """
     rows_primary: List[dict] = []
     rows_sens: List[dict] = []
 
@@ -475,6 +473,211 @@ def chem_event_tables(df: pd.DataFrame, tau_primary: float, tau_sens: Iterable[f
     return primary, sens
 
 
+def control_event_tables(df: pd.DataFrame, tau_sens: Iterable[float]) -> pd.DataFrame:
+    rows: List[dict] = []
+    taus = [float(t) for t in tau_sens]
+    ctrl = df[df["Treatment"].astype(str).str.upper() == "CONTROL"].copy()
+
+    for iso, g in ctrl.groupby("Isolate", dropna=False):
+        x = _to_num(g["LWR"])
+        n = int(x.notna().sum())
+        if n <= 0:
+            continue
+
+        for tau in taus:
+            k = int((x >= tau).sum())
+            p_hat = k / n
+            lo, hi = clopper_pearson_ci(k, n, alpha=0.05)
+            rows.append({
+                "isolate": iso, "treatment": "Control", "tau": tau,
+                "n": n, "k": k, "p_hat": p_hat, "ci_low": lo, "ci_high": hi,
+                "definition": "LWR >= tau",
+            })
+
+    out = pd.DataFrame(rows)
+    if len(out) > 0:
+        out = out.sort_values(["tau", "isolate"]).reset_index(drop=True)
+    return out
+
+
+def _tau_label(tau: float) -> str:
+    s = f"{float(tau):.2f}"
+    return "tau" + s.replace(".", "_")
+
+
+def make_tau_wide_table(df_long: pd.DataFrame) -> pd.DataFrame:
+    if df_long is None or len(df_long) == 0:
+        return pd.DataFrame()
+
+    out_rows: List[dict] = []
+    for keys, g in df_long.groupby(["isolate", "treatment"], dropna=False):
+        iso, trt = keys
+        row = {"isolate": iso, "treatment": trt}
+        g = g.sort_values("tau")
+        for _, r in g.iterrows():
+            lbl = _tau_label(float(r["tau"]))
+            row[f"n_{lbl}"] = int(r["n"])
+            row[f"k_{lbl}"] = int(r["k"])
+            row[f"p_hat_{lbl}"] = float(r["p_hat"])
+            row[f"ci_low_{lbl}"] = float(r["ci_low"])
+            row[f"ci_high_{lbl}"] = float(r["ci_high"])
+
+        taus_sorted = sorted([float(x) for x in g["tau"].dropna().unique().tolist()])
+        if len(taus_sorted) >= 2:
+            t_first = _tau_label(taus_sorted[0])
+            t_last = _tau_label(taus_sorted[-1])
+            p_first = row.get(f"p_hat_{t_first}", np.nan)
+            p_last = row.get(f"p_hat_{t_last}", np.nan)
+            k_first = row.get(f"k_{t_first}", np.nan)
+            k_last = row.get(f"k_{t_last}", np.nan)
+            row[f"delta_p_hat_{t_first}_to_{t_last}"] = (
+                float(p_last) - float(p_first)
+                if pd.notna(p_first) and pd.notna(p_last) else np.nan
+            )
+            row[f"delta_k_{t_first}_to_{t_last}"] = (
+                int(k_last) - int(k_first)
+                if pd.notna(k_first) and pd.notna(k_last) else np.nan
+            )
+        out_rows.append(row)
+
+    out = pd.DataFrame(out_rows)
+    if len(out) > 0:
+        out = out.sort_values(["isolate", "treatment"]).reset_index(drop=True)
+    return out
+
+
+def build_near_equal_potency_pairs(
+    sm: pd.DataFrame,
+    p_primary: pd.DataFrame,
+    max_abs_d_lambda: float = 0.05,
+    min_abs_d_I: float = 0.02,
+    top_n: int = 30,
+) -> pd.DataFrame:
+    if sm is None or len(sm) == 0:
+        return pd.DataFrame()
+
+    rows: List[dict] = []
+    p_lookup = None
+    if p_primary is not None and len(p_primary) > 0:
+        p_lookup = p_primary.set_index(["isolate", "treatment"])[["p_hat", "ci_low", "ci_high"]]
+
+    for iso, sub in sm.groupby("isolate", dropna=False):
+        by_trt = sub.set_index("treatment")
+        trts = list(by_trt.index.tolist())
+        for i in range(len(trts)):
+            for j in range(i + 1, len(trts)):
+                tA = trts[i]
+                tB = trts[j]
+                rA = by_trt.loc[tA]
+                rB = by_trt.loc[tB]
+
+                lamA = float(rA["lambda_area"])
+                lamB = float(rB["lambda_area"])
+                IA = float(rA["I_LWR"])
+                IB = float(rB["I_LWR"])
+                dlam = abs(lamA - lamB)
+                dI = abs(IA - IB)
+
+                if dlam <= max_abs_d_lambda and dI >= min_abs_d_I:
+                    rec = {
+                        "isolate": iso,
+                        "treatment_A": tA,
+                        "treatment_B": tB,
+                        "lambda_A": lamA,
+                        "lambda_B": lamB,
+                        "abs_delta_lambda": dlam,
+                        "I_A": IA,
+                        "I_B": IB,
+                        "abs_delta_I": dI,
+                    }
+                    if p_lookup is not None:
+                        for suffix, trt in [("A", tA), ("B", tB)]:
+                            try:
+                                rec[f"p_hat_{suffix}_tau1_10"] = float(p_lookup.loc[(iso, trt), "p_hat"])
+                                rec[f"ci_low_{suffix}_tau1_10"] = float(p_lookup.loc[(iso, trt), "ci_low"])
+                                rec[f"ci_high_{suffix}_tau1_10"] = float(p_lookup.loc[(iso, trt), "ci_high"])
+                            except Exception:
+                                rec[f"p_hat_{suffix}_tau1_10"] = np.nan
+                                rec[f"ci_low_{suffix}_tau1_10"] = np.nan
+                                rec[f"ci_high_{suffix}_tau1_10"] = np.nan
+                    rows.append(rec)
+
+    out = pd.DataFrame(rows)
+    if len(out) > 0:
+        out = out.sort_values(["abs_delta_I", "abs_delta_lambda"], ascending=[False, True]).head(int(top_n)).reset_index(drop=True)
+    return out
+
+
+def axis_reconstruction_validation(
+    df: pd.DataFrame,
+    axis_recon: pd.DataFrame,
+    how: str = "mean",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    needed = {"Length", "Width", "Isolate", "Treatment"}
+    if df is None or len(df) == 0 or not needed.issubset(set(df.columns)):
+        return pd.DataFrame(), pd.DataFrame()
+
+    direct_rows: List[dict] = []
+    for iso, g_iso in df.groupby("Isolate", dropna=False):
+        g_ctrl = g_iso[g_iso["Treatment"].astype(str).str.upper() == "CONTROL"]
+        if len(g_ctrl) == 0:
+            continue
+
+        Lc = _agg(g_ctrl["Length"], how)
+        Wc = _agg(g_ctrl["Width"], how)
+        if pd.isna(Lc) or pd.isna(Wc) or float(Lc) == 0 or float(Wc) == 0:
+            continue
+
+        for trt, g_trt in g_iso.groupby("Treatment", dropna=False):
+            if str(trt).strip().upper() == "CONTROL":
+                continue
+
+            Lt = _agg(g_trt["Length"], how)
+            Wt = _agg(g_trt["Width"], how)
+            if pd.isna(Lt) or pd.isna(Wt):
+                continue
+
+            direct_rows.append({
+                "isolate": iso,
+                "treatment": trt,
+                "length_ratio_direct": float(Lt) / float(Lc),
+                "width_ratio_direct": float(Wt) / float(Wc),
+            })
+
+    direct_df = pd.DataFrame(direct_rows)
+    if len(direct_df) == 0 or axis_recon is None or len(axis_recon) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    merged = axis_recon.merge(direct_df, on=["isolate", "treatment"], how="left")
+    if "a_ratio" not in merged.columns or "b_ratio" not in merged.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    merged["a_abs_err"] = (pd.to_numeric(merged["a_ratio"], errors="coerce") - pd.to_numeric(merged["length_ratio_direct"], errors="coerce")).abs()
+    merged["b_abs_err"] = (pd.to_numeric(merged["b_ratio"], errors="coerce") - pd.to_numeric(merged["width_ratio_direct"], errors="coerce")).abs()
+
+    def _pearson_or_nan(x: pd.Series, y: pd.Series) -> float:
+        x = pd.to_numeric(x, errors="coerce")
+        y = pd.to_numeric(y, errors="coerce")
+        ok = x.notna() & y.notna()
+        if int(ok.sum()) < 2:
+            return np.nan
+        return float(np.corrcoef(x[ok].to_numpy(dtype=float), y[ok].to_numpy(dtype=float))[0, 1])
+
+    summary = pd.DataFrame([
+        {"metric": "n_pairs", "value": int(len(merged))},
+        {"metric": "agg", "value": how},
+        {"metric": "pearson_r_a_vs_length_ratio", "value": _pearson_or_nan(merged["a_ratio"], merged["length_ratio_direct"])},
+        {"metric": "pearson_r_b_vs_width_ratio", "value": _pearson_or_nan(merged["b_ratio"], merged["width_ratio_direct"])},
+        {"metric": "mean_abs_err_a", "value": float(pd.to_numeric(merged["a_abs_err"], errors="coerce").mean())},
+        {"metric": "mean_abs_err_b", "value": float(pd.to_numeric(merged["b_abs_err"], errors="coerce").mean())},
+        {"metric": "max_abs_err_a", "value": float(pd.to_numeric(merged["a_abs_err"], errors="coerce").max())},
+        {"metric": "max_abs_err_b", "value": float(pd.to_numeric(merged["b_abs_err"], errors="coerce").max())},
+    ])
+
+    merged = merged.sort_values(["isolate", "treatment"]).reset_index(drop=True)
+    return merged, summary
+
+
 def make_moa_legend(df: pd.DataFrame) -> pd.DataFrame:
     uniq = sorted(df["Treatment"].dropna().unique())
     rows = []
@@ -501,12 +704,6 @@ def make_moa_legend(df: pd.DataFrame) -> pd.DataFrame:
 # UV computations
 # -------------------------
 def uv_lambda_I_vs_dose(df_uv: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    For each isolate:
-      baseline at time_min == 0
-      lambda(d) = -ln( mean(Area_t) / mean(Area_0) )
-      I(d)      = ln( mean(LWR_t) / mean(LWR_0) )
-    """
     out_lam: List[dict] = []
     out_I: List[dict] = []
 
@@ -551,12 +748,6 @@ def uv_lambda_I_vs_dose(df_uv: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
 
 def uv_coffee_shape_event_at_10min(df_uv: pd.DataFrame, tau: float, win: Tuple[float, float]) -> pd.DataFrame:
-    """
-    UV coffee event:
-      I_rep = ln(LWR_rep / LWR0_mean)
-      event if I_rep >= ln(tau)
-      exact Clopper–Pearson CI
-    """
     lo, hi = float(win[0]), float(win[1])
     I_star = float(math.log(float(tau)))
     rows: List[dict] = []
@@ -683,28 +874,23 @@ def build_metadata(
 # CLI
 # -------------------------
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    here = Path(__file__).resolve()
-    repo_root = here.parents[1]
-    data_dir = repo_root / "data"
-    outputs_dir = repo_root / "outputs"
-
     p = argparse.ArgumentParser(
         prog="chem_analysis_main.py",
-        description="Generate SupplementaryData_S1.xlsx (λ–I–p framework) from raw spreadsheets.",
+        description="Generate SupplementaryData_S1.xlsx from external input spreadsheets.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--chem-xlsx", type=Path, default=(data_dir / "Supplementary Data1_ISME Com.xlsx"),
-                   help="Chemical morphology spreadsheet (raw).")
+    p.add_argument("--chem-xlsx", type=Path, required=True,
+                   help="Chemical morphology spreadsheet (required).")
     p.add_argument("--chem-sheet", type=str, default=None,
                    help="Optional: specify chemical sheet name explicitly. If omitted, auto-detect.")
-    p.add_argument("--cacao-xlsx", type=Path, default=(data_dir / "Cacao.xlsx"),
-                   help="UV-C cacao spreadsheet (raw).")
-    p.add_argument("--coffee-xlsx", type=Path, default=(data_dir / "Coffee.xlsx"),
-                   help="UV-C coffee spreadsheet (raw).")
+    p.add_argument("--cacao-xlsx", type=Path, required=True,
+                   help="UV-C cacao spreadsheet (required).")
+    p.add_argument("--coffee-xlsx", type=Path, required=True,
+                   help="UV-C coffee spreadsheet (required).")
 
-    p.add_argument("--outdir", type=Path, default=outputs_dir,
-                   help="Output directory (used if --out-xlsx is not provided).")
+    p.add_argument("--outdir", type=Path, default=(Path.cwd() / "outputs"),
+                   help="Output directory (used if --out-xlsx is not provided). Defaults to ./outputs under the current working directory.")
 
     p.add_argument("--out-xlsx", type=Path, default=None,
                    help="Output workbook path (overrides --outdir).")
@@ -733,16 +919,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
 
-    chem_path: Path = args.chem_xlsx
-    cacao_path: Path = args.cacao_xlsx
-    coffee_path: Path = args.coffee_xlsx
-    out_xlsx: Path = (args.out_xlsx if args.out_xlsx is not None else (args.outdir / "SupplementaryData_S1.xlsx"))
+    chem_path = Path(args.chem_xlsx)
+    cacao_path = Path(args.cacao_xlsx)
+    coffee_path = Path(args.coffee_xlsx)
 
     if not chem_path.exists():
-        raise FileNotFoundError(
-            f"Chemical spreadsheet not found: {chem_path}\n"
-            f"Tip: place it under ./data/ or pass --chem-xlsx PATH"
-        )
+        raise FileNotFoundError(f"Chemical spreadsheet not found: {chem_path}")
+    if not args.skip_uv and not cacao_path.exists():
+        raise FileNotFoundError(f"Cacao UV spreadsheet not found: {cacao_path}")
+    if not args.skip_uv and not coffee_path.exists():
+        raise FileNotFoundError(f"Coffee UV spreadsheet not found: {coffee_path}")
+
+    out_xlsx: Path = (args.out_xlsx if args.out_xlsx is not None else (args.outdir / "SupplementaryData_S1.xlsx"))
+
+    print(f"[INFO] Chemical input: {chem_path}")
+    print(f"[INFO] Cacao UV input: {cacao_path}")
+    print(f"[INFO] Coffee UV input: {coffee_path}")
+    print(f"[INFO] Output workbook: {out_xlsx}")
 
     tau_sens = [float(x) for x in str(args.chem_tau_sens).split(",") if str(x).strip() != ""]
     uv_win_parts = [float(x) for x in str(args.uv_win).split(",")]
@@ -770,10 +963,18 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     print("[INFO] Computing chemical event tables...")
     p_primary, p_sens = chem_event_tables(chem_df, tau_primary=float(args.chem_tau_primary), tau_sens=tau_sens)
+    p_tau_wide = make_tau_wide_table(p_sens)
+    p_ctrl_sens = control_event_tables(chem_df, tau_sens=tau_sens)
+    p_ctrl_wide = make_tau_wide_table(p_ctrl_sens)
+
+    print("[INFO] Building near-equal potency / divergent polarity support table...")
+    supp_table_s1 = build_near_equal_potency_pairs(sm_mean, p_primary)
+
+    print("[INFO] Validating axis reconstruction against direct Length/Width ratios...")
+    axis_val, axis_val_summary = axis_reconstruction_validation(chem_df, ax_mean, how="mean")
 
     qa = qa_checks(sm_mean)
 
-    # UV (optional)
     cacao_df = None
     coffee_df = None
     lam_uv = pd.DataFrame()
@@ -781,17 +982,6 @@ def main(argv: Optional[List[str]] = None) -> None:
     coffee_event = pd.DataFrame()
 
     if not args.skip_uv:
-        if not cacao_path.exists():
-            raise FileNotFoundError(
-                f"UV-C cacao spreadsheet not found: {cacao_path}\n"
-                f"Tip: place it under ./data/ or pass --cacao-xlsx PATH, or use --skip-uv."
-            )
-        if not coffee_path.exists():
-            raise FileNotFoundError(
-                f"UV-C coffee spreadsheet not found: {coffee_path}\n"
-                f"Tip: place it under ./data/ or pass --coffee-xlsx PATH, or use --skip-uv."
-            )
-
         print(f"[INFO] Loading UV-C cacao data: {cacao_path}")
         cacao_df = load_uv_dataframe(cacao_path)
         print(f"[INFO] Loading UV-C coffee data: {coffee_path}")
@@ -812,15 +1002,24 @@ def main(argv: Optional[List[str]] = None) -> None:
         uv_win=None if args.skip_uv else uv_win,
     )
 
-    # Write workbook
     with pd.ExcelWriter(str(out_xlsx), engine="openpyxl") as xw:
-        # manuscript/main tables
         sm_mean.to_excel(xw, index=False, sheet_name="summary_metrics")
         ax_mean.to_excel(xw, index=False, sheet_name="Axis_Reconstruction")
         p_primary.to_excel(xw, index=False, sheet_name="pI_Chem_tauPrimary")
         p_sens.to_excel(xw, index=False, sheet_name="pI_Chem_tauSensitivity")
+        if len(p_tau_wide) > 0:
+            p_tau_wide.to_excel(xw, index=False, sheet_name="pI_Chem_tauWide")
+        if len(p_ctrl_sens) > 0:
+            p_ctrl_sens.to_excel(xw, index=False, sheet_name="pI_Control_tauSensitivity")
+        if len(p_ctrl_wide) > 0:
+            p_ctrl_wide.to_excel(xw, index=False, sheet_name="pI_Control_tauWide")
+        if len(supp_table_s1) > 0:
+            supp_table_s1.to_excel(xw, index=False, sheet_name="Supplementary_Table_S1")
+        if len(axis_val) > 0:
+            axis_val.to_excel(xw, index=False, sheet_name="Axis_Reconstruction_Validation")
+        if len(axis_val_summary) > 0:
+            axis_val_summary.to_excel(xw, index=False, sheet_name="Axis_Recon_Val_Summary")
 
-        # sensitivity/QA
         if not args.skip_median and len(sm_med) > 0:
             sm_med.to_excel(xw, index=False, sheet_name="summary_metrics_MEDIAN")
         if not args.skip_median and len(ax_med) > 0:
