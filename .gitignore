@@ -1,0 +1,19 @@
+# Data and generated outputs
+data/*.xlsx
+data/*.csv
+outputs/
+figures/
+!.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
